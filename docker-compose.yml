@@ -1,0 +1,16 @@
+services:
+  toy-erp:
+    build: .
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    environment:
+      - DB_PATH=/data/erp.db
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - SEED_RANDOM=${SEED_RANDOM:-42}
+      - ERP_PUBLIC_URL=${ERP_PUBLIC_URL:-http://127.0.0.1:8000}
+    volumes:
+      - erp-data:/data
+
+volumes:
+  erp-data:
