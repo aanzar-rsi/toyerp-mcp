@@ -7,7 +7,7 @@ DB_PATH = os.environ.get("DB_PATH", "data/erp.db")
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "schema.sql")
 MIGRATIONS = [
     os.path.join(os.path.dirname(__file__), "..", "data", f"migration_{version:03d}.sql")
-    for version in (1, 2)
+    for version in (1, 2, 3)
 ]
 
 
@@ -34,6 +34,15 @@ def migrate_schema(path: str = DB_PATH) -> None:
         for version, path_file in enumerate(MIGRATIONS, 1):
             if current >= version:
                 continue
+            if version == 3:
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                vendor_columns = ({row[1] for row in conn.execute("PRAGMA table_info(vendors)")}
+                                  if "vendors" in tables else set())
+                # Partial legacy fixtures may omit ERP tables; fresh schemas already contain v3.
+                if "vendors" not in tables or "active_contract" in vendor_columns:
+                    conn.execute("PRAGMA user_version = 3")
+                    conn.commit()
+                    continue
             # executescript commits implicitly; wrap each version in its own transaction.
             with open(path_file, "r", encoding="utf-8") as f:
                 conn.executescript(f"BEGIN;\n{f.read()}\nPRAGMA user_version = {version};\nCOMMIT;")
@@ -61,6 +70,28 @@ def get_conn(path: str = None):
 
 def rows_to_dicts(rows) -> list:
     return [dict(r) for r in rows]
+
+
+def page_args(limit, after_id):
+    """Validate the common keyset pagination inputs."""
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        return "limit must be an integer between 1 and 1000"
+    if type(after_id) is not int or after_id < 0:
+        return "after_id must be a nonnegative integer"
+
+
+def paged_result(rows, limit: int, id_key: str, transform=dict) -> dict:
+    """Build a bounded page from a LIMIT + 1 query."""
+    has_more = len(rows) > limit
+    items = [transform(row) for row in rows[:limit]]
+    return bapi_result(data={
+        "items": items,
+        "page": {
+            "limit": limit,
+            "next_after_id": items[-1][id_key] if has_more else None,
+            "has_more": has_more,
+        },
+    })
 
 
 def bapi_result(data=None, messages=None) -> dict:

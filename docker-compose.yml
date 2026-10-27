@@ -8,6 +8,7 @@ services:
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
       - SEED_RANDOM=${SEED_RANDOM:-42}
+      - ERP_SEED_PROFILE=${ERP_SEED_PROFILE:-medium}
       - ERP_PUBLIC_URL=${ERP_PUBLIC_URL:-http://127.0.0.1:8000}
     volumes:
       - erp-data:/data

@@ -12,18 +12,19 @@ def main():
         print(f"[entrypoint] {DB_PATH} not found, initializing schema + seed data...")
         init_schema(DB_PATH)
         from data.seed import run_seed
-        run_seed()
+        run_seed(os.environ.get("ERP_SEED_PROFILE", "medium"))
         print("[entrypoint] seed complete")
     else:
         print(f"[entrypoint] using existing database at {DB_PATH}")
     migrate_schema(DB_PATH)
 
-    from server.db import get_conn
-    with get_conn() as conn:
-        if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-            print("[entrypoint] no admin yet; run `docker compose exec toy-erp python -m server.bootstrap_admin`", flush=True)
+    from server.mcp_server import TOOL_NAMES, mcp
+    from server.security import provision_default_users
+    created = provision_default_users(TOOL_NAMES)
+    if created:
+        print(f"[entrypoint] created default users: {', '.join(created)}", flush=True)
+        print("[entrypoint] WARNING: change demo passwords in scripts/default_users.txt before deployment", flush=True)
 
-    from server.mcp_server import mcp
     mcp.run(
         transport="streamable-http",
         host=os.environ.get("MCP_HOST", "0.0.0.0"),

@@ -1,6 +1,6 @@
 """Sales order BAPIs."""
 from datetime import date
-from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts
+from server.db import get_conn, bapi_result, bapi_error, page_args, paged_result
 
 DEFAULT_PLANT = "1000"
 
@@ -56,7 +56,10 @@ def BAPI_SALESORDER_CREATE(customer_id: int, items: list) -> dict:
     )
 
 
-def BAPI_SALESORDER_GETLIST(customer_id: int = None, status: str = None) -> dict:
+def BAPI_SALESORDER_GETLIST(customer_id: int = None, status: str = None,
+                            limit: int = 100, after_id: int = 0) -> dict:
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     query = "SELECT * FROM sales_orders WHERE 1=1"
     params = []
     if customer_id is not None:
@@ -65,6 +68,8 @@ def BAPI_SALESORDER_GETLIST(customer_id: int = None, status: str = None) -> dict
     if status:
         query += " AND status = ?"
         params.append(status)
+    query += " AND so_id > ? ORDER BY so_id LIMIT ?"
+    params.extend((after_id, limit + 1))
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
-    return bapi_result(data=rows_to_dicts(rows))
+    return paged_result(rows, limit, "so_id")

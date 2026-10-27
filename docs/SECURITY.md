@@ -1,5 +1,9 @@
 # Security and Access Control
 
+For end-to-end table setup, user/role commands, the admin HTTP API, and agent
+configuration examples, see [Authentication, Users, Permissions, and Agent
+Connections](AUTHENTICATION.md).
+
 ## Auth model
 
 - MCP endpoint `/mcp` requires `Authorization: Bearer <token>`.
@@ -19,11 +23,13 @@
 - Per-user lockout after 5 failed attempts.
 - Lockout duration: 15 minutes.
 
-## Bootstrap admin
+## Default admin and roles
 
-- Initial admin creation is only possible via CLI:
-  - `python -m server.bootstrap_admin`
-- It is interactive and one-time only (before first user exists).
+- Startup creates the administrator and team users listed in
+  `scripts/default_users.txt` if those usernames do not exist.
+- Checked-in passwords are local demo credentials; change them before exposure.
+- Startup never replaces an existing password.
+- Standard roles and missing standard grants are added idempotently.
 
 ## Authorization model
 

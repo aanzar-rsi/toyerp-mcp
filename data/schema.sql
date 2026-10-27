@@ -6,7 +6,16 @@ CREATE TABLE vendors (
     contact_email  TEXT,
     address        TEXT,
     payment_terms  TEXT DEFAULT 'NET30',
-    status         TEXT NOT NULL DEFAULT 'ACTIVE'
+    status         TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_date   TEXT,
+    phone          TEXT,
+    country        TEXT,
+    currency       TEXT NOT NULL DEFAULT 'USD',
+    rating         REAL CHECK (rating BETWEEN 1 AND 5),
+    lead_time_days INTEGER,
+    contract_start_date TEXT,
+    contract_end_date   TEXT,
+    active_contract INTEGER NOT NULL DEFAULT 1 CHECK (active_contract IN (0, 1))
 );
 
 CREATE TABLE customers (
@@ -14,7 +23,16 @@ CREATE TABLE customers (
     name           TEXT NOT NULL,
     address        TEXT,
     credit_limit   REAL DEFAULT 10000,
-    status         TEXT NOT NULL DEFAULT 'ACTIVE'
+    status         TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_date   TEXT,
+    contact_email  TEXT,
+    phone          TEXT,
+    country        TEXT,
+    customer_type  TEXT,
+    industry       TEXT,
+    payment_terms  TEXT DEFAULT 'NET30',
+    credit_rating  TEXT,
+    risk_level     TEXT
 );
 
 CREATE TABLE materials (
@@ -22,7 +40,27 @@ CREATE TABLE materials (
     description    TEXT NOT NULL,
     uom            TEXT NOT NULL DEFAULT 'EA',
     unit_price     REAL NOT NULL,
-    category       TEXT
+    category       TEXT,
+    sku            TEXT UNIQUE,
+    cost_price     REAL,
+    brand          TEXT,
+    country_of_origin TEXT,
+    reorder_level  REAL DEFAULT 0,
+    created_date   TEXT,
+    status         TEXT NOT NULL DEFAULT 'ACTIVE'
+);
+
+CREATE TABLE vendor_materials (
+    vendor_id      INTEGER NOT NULL REFERENCES vendors(vendor_id),
+    material_id    INTEGER NOT NULL REFERENCES materials(material_id),
+    vendor_sku     TEXT NOT NULL,
+    unit_price     REAL NOT NULL,
+    minimum_order_qty REAL NOT NULL DEFAULT 1,
+    lead_time_days INTEGER NOT NULL,
+    valid_from     TEXT NOT NULL,
+    valid_to       TEXT,
+    is_active      INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    PRIMARY KEY (vendor_id, material_id)
 );
 
 CREATE TABLE stock (
@@ -54,7 +92,12 @@ CREATE TABLE goods_receipts (
     po_id          INTEGER NOT NULL REFERENCES purchase_orders(po_id),
     material_id    INTEGER NOT NULL REFERENCES materials(material_id),
     qty            REAL NOT NULL,
-    posted_date    TEXT NOT NULL
+    posted_date    TEXT NOT NULL,
+    accepted_qty   REAL,
+    rejected_qty   REAL NOT NULL DEFAULT 0,
+    warehouse      TEXT,
+    quality_status TEXT,
+    delivery_note  TEXT
 );
 
 CREATE TABLE sales_orders (
@@ -62,7 +105,11 @@ CREATE TABLE sales_orders (
     customer_id    INTEGER NOT NULL REFERENCES customers(customer_id),
     status         TEXT NOT NULL DEFAULT 'OPEN',
     created_date   TEXT NOT NULL,
-    total_amount   REAL NOT NULL DEFAULT 0
+    total_amount   REAL NOT NULL DEFAULT 0,
+    requested_delivery_date TEXT,
+    fulfilled_date TEXT,
+    sales_channel  TEXT,
+    priority       TEXT
 );
 
 CREATE TABLE so_items (
@@ -74,6 +121,17 @@ CREATE TABLE so_items (
     PRIMARY KEY (so_id, item_no)
 );
 
+CREATE TABLE shipments (
+    shipment_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_id           INTEGER NOT NULL REFERENCES sales_orders(so_id),
+    warehouse       TEXT NOT NULL,
+    carrier         TEXT NOT NULL,
+    tracking_number TEXT NOT NULL UNIQUE,
+    shipped_date    TEXT NOT NULL,
+    delivered_date  TEXT,
+    status           TEXT NOT NULL
+);
+
 CREATE TABLE invoices (
     invoice_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     direction      TEXT NOT NULL CHECK (direction IN ('AP', 'AR')),
@@ -81,7 +139,14 @@ CREATE TABLE invoices (
     reference      TEXT,
     amount         REAL NOT NULL,
     status         TEXT NOT NULL DEFAULT 'OPEN',
-    due_date       TEXT
+    due_date       TEXT,
+    invoice_date   TEXT,
+    paid_date      TEXT,
+    currency       TEXT NOT NULL DEFAULT 'USD',
+    tax_amount     REAL NOT NULL DEFAULT 0,
+    source_type    TEXT,
+    source_id      INTEGER,
+    dispute_status TEXT NOT NULL DEFAULT 'NONE'
 );
 
 CREATE TABLE payments (
@@ -136,7 +201,14 @@ CREATE TABLE employees (
     hire_date      TEXT NOT NULL,
     monthly_salary INTEGER NOT NULL CHECK (monthly_salary > 0),
     leave_balance  INTEGER NOT NULL DEFAULT 20 CHECK (leave_balance >= 0),
-    status         TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE'))
+    status         TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'INACTIVE')),
+    employee_number TEXT UNIQUE,
+    job_title      TEXT,
+    manager_id     INTEGER REFERENCES employees(employee_id),
+    location       TEXT,
+    employment_type TEXT,
+    contract_end_date TEXT,
+    performance_rating REAL CHECK (performance_rating BETWEEN 1 AND 5)
 );
 
 CREATE TABLE leave_requests (
@@ -146,6 +218,10 @@ CREATE TABLE leave_requests (
     end_date       TEXT NOT NULL,
     days           INTEGER NOT NULL CHECK (days > 0),
     status         TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    leave_type     TEXT NOT NULL DEFAULT 'ANNUAL',
+    requested_date TEXT,
+    decision_date  TEXT,
+    reason         TEXT,
     CHECK (end_date >= start_date)
 );
 
@@ -208,6 +284,17 @@ CREATE TABLE sessions (
 );
 
 CREATE INDEX sessions_user_idx ON sessions(user_id);
+
+CREATE INDEX vendors_status_idx ON vendors(status);
+CREATE INDEX customers_status_idx ON customers(status);
+CREATE INDEX vendor_materials_material_idx ON vendor_materials(material_id, is_active);
+CREATE INDEX po_vendor_status_date_idx ON purchase_orders(vendor_id, status, created_date);
+CREATE INDEX gr_po_date_idx ON goods_receipts(po_id, posted_date);
+CREATE INDEX so_customer_status_date_idx ON sales_orders(customer_id, status, created_date);
+CREATE INDEX invoice_party_status_due_idx ON invoices(direction, party_id, status, due_date);
+CREATE INDEX payment_invoice_date_idx ON payments(invoice_id, posted_date);
+CREATE INDEX leave_employee_status_date_idx ON leave_requests(employee_id, status, start_date);
+CREATE INDEX journal_posting_date_idx ON journal_entries(posting_date);
 
 CREATE TABLE security_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,

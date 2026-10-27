@@ -1,7 +1,7 @@
 """Departments, employees, leave requests and monthly payroll."""
 from datetime import date
 
-from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts
+from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts, page_args, paged_result
 from server.bapi.finance import _cents, _gl_account_id, _post_journal
 
 
@@ -58,14 +58,17 @@ def _employee(row):
     return {**dict(row), "monthly_salary": row["monthly_salary"] / 100}
 
 
-def BAPI_HR_EMPLOYEE_GETLIST(department_id: int = None, status: str = None) -> dict:
+def BAPI_HR_EMPLOYEE_GETLIST(department_id: int = None, status: str = None,
+                             limit: int = 100, after_id: int = 0) -> dict:
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM employees WHERE (? IS NULL OR department_id = ?) "
-            "AND (? IS NULL OR status = ?) ORDER BY employee_id",
-            (department_id, department_id, status, status),
+            "AND (? IS NULL OR status = ?) AND employee_id > ? ORDER BY employee_id LIMIT ?",
+            (department_id, department_id, status, status, after_id, limit + 1),
         ).fetchall()
-    return bapi_result(data=[_employee(row) for row in rows])
+    return paged_result(rows, limit, "employee_id", _employee)
 
 
 def BAPI_HR_EMPLOYEE_GETDETAIL(employee_id: int) -> dict:
@@ -105,8 +108,8 @@ def BAPI_HR_LEAVE_REQUEST(employee_id: int, start_date: str, end_date: str) -> d
         ).fetchone():
             return bapi_error("Leave overlaps an existing request")
         leave_id = conn.execute(
-            "INSERT INTO leave_requests (employee_id, start_date, end_date, days) VALUES (?, ?, ?, ?)",
-            (employee_id, start_date, end_date, days),
+            "INSERT INTO leave_requests (employee_id, start_date, end_date, days, requested_date) VALUES (?, ?, ?, ?, ?)",
+            (employee_id, start_date, end_date, days, date.today().isoformat()),
         ).lastrowid
     return bapi_result(data={"leave_id": leave_id, "days": days})
 
@@ -124,18 +127,21 @@ def BAPI_HR_LEAVE_DECIDE(leave_id: int, approve: bool) -> dict:
             )
             if not updated.rowcount:
                 return bapi_error("Employee inactive or insufficient leave balance")
-        conn.execute("UPDATE leave_requests SET status = ? WHERE leave_id = ?",
-                     ("APPROVED" if approve else "REJECTED", leave_id))
+        conn.execute("UPDATE leave_requests SET status = ?, decision_date = ? WHERE leave_id = ?",
+                     ("APPROVED" if approve else "REJECTED", date.today().isoformat(), leave_id))
     return bapi_result()
 
 
-def BAPI_HR_LEAVE_GETLIST(employee_id: int = None) -> dict:
+def BAPI_HR_LEAVE_GETLIST(employee_id: int = None, limit: int = 100, after_id: int = 0) -> dict:
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM leave_requests WHERE (? IS NULL OR employee_id = ?) ORDER BY leave_id",
-            (employee_id, employee_id),
+            "SELECT * FROM leave_requests WHERE (? IS NULL OR employee_id = ?) "
+            "AND leave_id > ? ORDER BY leave_id LIMIT ?",
+            (employee_id, employee_id, after_id, limit + 1),
         ).fetchall()
-    return bapi_result(data=rows_to_dicts(rows))
+    return paged_result(rows, limit, "leave_id")
 
 
 def BAPI_HR_PAYROLL_RUN(period: str, deductions: list = None) -> dict:
@@ -195,12 +201,18 @@ def BAPI_HR_PAYROLL_RUN(period: str, deductions: list = None) -> dict:
     return bapi_result(data={"run_id": run_id, "employee_count": len(employees)})
 
 
-def BAPI_HR_PAYSLIP_GETLIST(period: str = None, employee_id: int = None) -> dict:
+def BAPI_HR_PAYSLIP_GETLIST(period: str = None, employee_id: int = None,
+                            limit: int = 100, after_id: int = 0) -> dict:
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT p.*, r.period FROM payslips p JOIN payroll_runs r ON r.run_id = p.run_id "
-            "WHERE (? IS NULL OR r.period = ?) AND (? IS NULL OR p.employee_id = ?) ORDER BY p.payslip_id",
-            (period, period, employee_id, employee_id),
+            "WHERE (? IS NULL OR r.period = ?) AND (? IS NULL OR p.employee_id = ?) "
+            "AND p.payslip_id > ? ORDER BY p.payslip_id LIMIT ?",
+            (period, period, employee_id, employee_id, after_id, limit + 1),
         ).fetchall()
-    return bapi_result(data=[{**dict(row), "gross": row["gross"] / 100,
-                              "deduction": row["deduction"] / 100, "net": row["net"] / 100} for row in rows])
+    return paged_result(rows, limit, "payslip_id", lambda row: {
+        **dict(row), "gross": row["gross"] / 100,
+        "deduction": row["deduction"] / 100, "net": row["net"] / 100,
+    })

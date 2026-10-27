@@ -1,6 +1,6 @@
 """Purchase order + goods receipt BAPIs."""
 from datetime import date
-from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts
+from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts, page_args, paged_result
 
 DEFAULT_PLANT = "1000"
 
@@ -18,11 +18,13 @@ def BAPI_PO_CREATE(vendor_id: int, items: list) -> dict:
         resolved_items = []
         for item in items:
             material = conn.execute(
-                "SELECT unit_price FROM materials WHERE material_id = ?", (item["material_id"],)
+                "SELECT m.unit_price, vm.unit_price AS vendor_price FROM materials m "
+                "LEFT JOIN vendor_materials vm ON vm.material_id=m.material_id AND vm.vendor_id=? AND vm.is_active=1 "
+                "WHERE m.material_id = ?", (vendor_id, item["material_id"])
             ).fetchone()
             if not material:
                 return bapi_error(f"Material {item['material_id']} not found")
-            unit_price = item.get("unit_price", material["unit_price"])
+            unit_price = item.get("unit_price", material["vendor_price"] or material["unit_price"])
             qty = item["qty"]
             total += unit_price * qty
             resolved_items.append((item["material_id"], qty, unit_price))
@@ -52,7 +54,10 @@ def BAPI_PO_GETDETAIL(po_id: int) -> dict:
     return bapi_result(data={"po": dict(po), "items": rows_to_dicts(items)})
 
 
-def BAPI_PO_GETLIST(vendor_id: int = None, status: str = None) -> dict:
+def BAPI_PO_GETLIST(vendor_id: int = None, status: str = None,
+                    limit: int = 100, after_id: int = 0) -> dict:
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     query = "SELECT * FROM purchase_orders WHERE 1=1"
     params = []
     if vendor_id is not None:
@@ -61,9 +66,11 @@ def BAPI_PO_GETLIST(vendor_id: int = None, status: str = None) -> dict:
     if status:
         query += " AND status = ?"
         params.append(status)
+    query += " AND po_id > ? ORDER BY po_id LIMIT ?"
+    params.extend((after_id, limit + 1))
     with get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
-    return bapi_result(data=rows_to_dicts(rows))
+    return paged_result(rows, limit, "po_id")
 
 
 def BAPI_PO_CHANGE(po_id: int, status: str) -> dict:
@@ -85,8 +92,9 @@ def BAPI_GOODSMVT_CREATE(po_id: int, material_id: int, qty: float) -> dict:
             return bapi_error(f"Material {material_id} is not on purchase order {po_id}")
 
         cur = conn.execute(
-            "INSERT INTO goods_receipts (po_id, material_id, qty, posted_date) VALUES (?, ?, ?, ?)",
-            (po_id, material_id, qty, date.today().isoformat()),
+            "INSERT INTO goods_receipts (po_id, material_id, qty, posted_date, accepted_qty, warehouse, quality_status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PASSED')",
+            (po_id, material_id, qty, date.today().isoformat(), qty, DEFAULT_PLANT),
         )
         gr_id = cur.lastrowid
         conn.execute(

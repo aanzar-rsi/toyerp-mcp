@@ -29,7 +29,8 @@ State is persisted in SQLite. Each BAPI call is a single transaction.
   - role/user permission resolution
   - admin mutation operations
 - `data/seed.py`
-  - creates synthetic data by calling BAPI functions (not raw SQL)
+  - bulk-generates deterministic, connected ERP histories in batched transactions
+  - validates minimum counts, foreign keys, and nonnegative stock
 
 ## Tool discovery model
 
@@ -71,5 +72,5 @@ Core tables:
 ## Migrations
 
 - Base schema: `data/schema.sql`
-- Incremental files: `data/migration_001.sql`, `data/migration_002.sql`
+- Incremental files: `data/migration_001.sql` through `data/migration_003.sql`
 - Version tracked by `PRAGMA user_version`.

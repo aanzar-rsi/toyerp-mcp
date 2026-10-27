@@ -12,6 +12,7 @@ MCP calls.
 - HTTP auth (`/auth/login`, `/auth/logout`) and admin APIs (`/admin/*`) for
   user, role, and tool-permission management.
 - First-boot schema init + synthetic data seeding; restart-safe migrations.
+- Deterministic `medium` and `large` bulk-data profiles with connected ERP history.
 - Test suite covering ERP flows, migration safety, and security behavior.
 
 ## Table of contents
@@ -34,16 +35,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Then create the first admin user (one-time bootstrap):
-
-```bash
-docker compose exec toy-erp python -m server.bootstrap_admin
-```
-
 Notes:
 - Compose publishes `127.0.0.1:${MCP_PORT}` by default (localhost only).
-- On first run, the container initializes `/data/erp.db`, seeds data, and applies
-  migrations.
+- On first run, the container initializes `/data/erp.db`, seeds data, applies
+  migrations, and creates users from `scripts/default_users.txt`.
+- Startup creates the demo administrator and team users listed in
+  `scripts/default_users.txt`; change those local/demo passwords before exposure.
 - On later runs, existing data is preserved and pending migrations are applied.
 
 ## Quick start (local)
@@ -55,12 +52,6 @@ pip install -r requirements.txt
 python -m server.entrypoint
 ```
 
-Bootstrap admin locally (same DB):
-
-```bash
-python -m server.bootstrap_admin
-```
-
 ## Connect an MCP client
 
 1) Log in and get a bearer token:
@@ -68,7 +59,7 @@ python -m server.bootstrap_admin
 ```bash
 curl -sS http://127.0.0.1:8000/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"your-password"}'
+  -d '{"username":"ahad-anzar","password":"your-password"}'
 ```
 
 2) Use `Authorization: Bearer <access_token>` when calling `/mcp`.
@@ -122,6 +113,9 @@ Permission resolution:
 - User-level allow/deny overrides role grants.
 - Tool visibility and invocation are both enforced at runtime.
 
+Standard roles created at startup: `HR_ALL`, `FINANCE_ALL`, `PROCUREMENT_ALL`,
+`SALES_ALL`, `INVENTORY_ALL`, `MASTER_DATA_ALL`, and `ERP_READ_ONLY`.
+
 ## BAPI tools
 
 All tools are discovered automatically by introspecting `BAPI_*` functions in
@@ -132,6 +126,16 @@ Every tool returns:
 ```json
 {"RETURN": [{"type": "S" | "E", "message": "..."}], "DATA": ...}
 ```
+
+All `GETLIST` tools use bounded keyset pagination. They accept `limit` (default
+100, maximum 1,000) and `after_id` (default 0), and return:
+
+```json
+{"DATA": {"items": [], "page": {"limit": 100, "next_after_id": 100, "has_more": true}}}
+```
+
+Pass `next_after_id` back as `after_id` to read the next page. A final page has
+`has_more: false` and `next_after_id: null`.
 
 ### Vendor
 
@@ -212,6 +216,9 @@ server/
   bootstrap_admin.py
   security.py
   bapi/
+scripts/
+  erp_admin.py
+  mcp_client.py
 tests/
   test_bapi.py
   test_security.py
@@ -231,6 +238,21 @@ Run one test function:
 pytest tests/test_bapi.py::test_ap_payment_updates_gl
 ```
 
+## Generate large synthetic data
+
+First boot uses the `medium` profile, which creates at least 2,000 rows in each
+major ERP table. To build the much larger stress profile in a new database:
+
+```bash
+python -m data.seed --database data/large.db --profile large --seed 42
+```
+
+To replace that selected database, add `--reset`. The generator otherwise
+refuses to seed a nonempty database. Docker accepts `ERP_SEED_PROFILE=large`
+before its first start. Profiles generate connected vendor catalogs, purchasing,
+receipts, inventory, sales fulfillment, AP/AR invoices and payments, employees,
+leave, payroll, and balanced journal entries.
+
 ## Deployment notes
 
 - For non-localhost deployment, put HTTPS reverse proxy in front.
@@ -242,6 +264,7 @@ pytest tests/test_bapi.py::test_ap_payment_updates_gl
 ## Documentation map
 
 - Setup and environment: `docs/SETUP.md`
+- Authentication, users, permissions, and agent connections: `docs/AUTHENTICATION.md`
 - Architecture and data flow: `docs/ARCHITECTURE.md`
 - Security and access control: `docs/SECURITY.md`
 - Collaboration workflow: `CONTRIBUTING.md`

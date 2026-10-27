@@ -4,6 +4,7 @@ import hmac
 import re
 import secrets
 import time
+from pathlib import Path
 
 from mcp.server.auth.provider import AccessToken
 
@@ -13,6 +14,117 @@ TOKEN_TTL = 3600
 PASSWORD_ITERATIONS = 600_000
 USERNAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{2,63}\Z")
 ROLE_NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{1,63}\Z")
+DEFAULT_USERS_PATH = Path(__file__).resolve().parents[1] / "scripts" / "default_users.txt"
+
+
+def default_roles(registered: set[str]) -> dict[str, set[str]]:
+    """Return the standard least-privilege role templates."""
+    finance = {tool for tool in registered if tool.startswith("BAPI_GL_") or
+               tool.startswith(("BAPI_AP_", "BAPI_AR_", "BAPI_INCOMINGINVOICE_"))}
+    return {
+        "HR_ALL": {tool for tool in registered if tool.startswith("BAPI_HR_")},
+        "FINANCE_ALL": finance,
+        "PROCUREMENT_ALL": {tool for tool in registered if tool.startswith(
+            ("BAPI_VENDOR_", "BAPI_PO_", "BAPI_GOODSMVT_", "BAPI_MATERIAL_"))},
+        "SALES_ALL": {tool for tool in registered if tool.startswith(
+            ("BAPI_CUSTOMER_", "BAPI_SALESORDER_", "BAPI_AR_"))},
+        "INVENTORY_ALL": {tool for tool in registered if tool.startswith(
+            ("BAPI_MATERIAL_", "BAPI_GOODSMVT_"))},
+        "MASTER_DATA_ALL": {tool for tool in registered if tool.startswith(
+            ("BAPI_VENDOR_", "BAPI_CUSTOMER_", "BAPI_MATERIAL_"))},
+        "ERP_READ_ONLY": {tool for tool in registered if
+                          "_GETLIST" in tool or "_GETDETAIL" in tool or tool.endswith("_SUMMARY")},
+    }
+
+
+def load_default_users(path=DEFAULT_USERS_PATH) -> list[tuple[str, str, str]]:
+    """Read username|password|role demo accounts from the configured text file."""
+    users = []
+    for line_no, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) != 3:
+            raise ValueError(f"Invalid default user on line {line_no}: expected username|password|role")
+        username, password, role = (part.strip() for part in parts)
+        if not USERNAME.fullmatch(username):
+            raise ValueError(f"Invalid default username on line {line_no}")
+        password_hash(password)  # Validate before opening the provisioning transaction.
+        if role != "ADMIN" and not ROLE_NAME.fullmatch(role):
+            raise ValueError(f"Invalid default role on line {line_no}")
+        users.append((username, password, role))
+    if not users or not any(role == "ADMIN" for _, _, role in users):
+        raise ValueError("Default users file must contain at least one ADMIN")
+    if len({username for username, _, _ in users}) != len(users):
+        raise ValueError("Default users file contains duplicate usernames")
+    return users
+
+
+def provision_default_users(registered: set[str], path=DEFAULT_USERS_PATH) -> list[str]:
+    """Create missing file-defined users and standard roles without resetting accounts."""
+    roles = default_roles(registered)
+    users = load_default_users(path)
+    unknown = {role for _, _, role in users if role != "ADMIN"} - roles.keys()
+    if unknown:
+        raise ValueError(f"Unknown default role(s): {', '.join(sorted(unknown))}")
+    created = []
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for name, tools in roles.items():
+            conn.execute("INSERT OR IGNORE INTO roles (name) VALUES (?)", (name,))
+            role_id = conn.execute("SELECT role_id FROM roles WHERE name = ?", (name,)).fetchone()[0]
+            conn.executemany("INSERT OR IGNORE INTO role_tools (role_id, tool_name) VALUES (?, ?)",
+                             ((role_id, tool) for tool in tools))
+        for username, password, role in users:
+            existing = conn.execute("SELECT user_id, is_admin FROM users WHERE username = ?", (username,)).fetchone()
+            if existing:
+                if role == "ADMIN" and not existing["is_admin"]:
+                    raise ValueError(f"Default administrator {username!r} belongs to a non-admin user")
+                user_id = existing["user_id"]
+            else:
+                user_id = conn.execute(
+                    "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)",
+                    (username, password_hash(password), int(role == "ADMIN")),
+                ).lastrowid
+                audit(conn, username, "default_user_created", role)
+                created.append(username)
+            if role != "ADMIN":
+                role_id = conn.execute("SELECT role_id FROM roles WHERE name = ?", (role,)).fetchone()[0]
+                conn.execute("INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)",
+                             (user_id, role_id))
+    return created
+
+
+def provision_security_defaults(registered: set[str], username: str = "super_admin",
+                                password: str | None = None) -> str | None:
+    """Ensure the default admin and roles exist; return a generated password once."""
+    if not USERNAME.fullmatch(username):
+        raise ValueError("ERP_SUPER_ADMIN_USERNAME is invalid")
+    roles = default_roles(registered)
+    if any(not tools for tools in roles.values()):
+        raise ValueError("A default role has no registered tools")
+
+    generated = None
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute("SELECT is_admin FROM users WHERE username = ?", (username,)).fetchone()
+        if existing and not existing["is_admin"]:
+            raise ValueError(f"Default administrator username {username!r} belongs to a non-admin user")
+        if not existing:
+            if password is None:
+                generated = secrets.token_urlsafe(24)
+                password = generated
+            conn.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                         (username, password_hash(password)))
+            audit(conn, username, "default_super_admin_created")
+
+        for name, tools in roles.items():
+            conn.execute("INSERT OR IGNORE INTO roles (name) VALUES (?)", (name,))
+            role_id = conn.execute("SELECT role_id FROM roles WHERE name = ?", (name,)).fetchone()[0]
+            conn.executemany("INSERT OR IGNORE INTO role_tools (role_id, tool_name) VALUES (?, ?)",
+                             ((role_id, tool) for tool in tools))
+    return generated
 
 
 def password_hash(password: str) -> str:

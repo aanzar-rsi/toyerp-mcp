@@ -1,7 +1,7 @@
 """AP/AR invoicing, payments, and GL BAPIs."""
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts
+from server.db import get_conn, bapi_result, bapi_error, rows_to_dicts, page_args, paged_result
 
 
 def _gl_account_id(conn, name: str) -> int:
@@ -69,24 +69,32 @@ def BAPI_GL_JOURNAL_POST(lines: list, reference: str = "") -> dict:
     return bapi_result(data={"journal_id": journal_id})
 
 
-def BAPI_GL_JOURNAL_GETLIST(account_id: int = None) -> dict:
+def BAPI_GL_JOURNAL_GETLIST(account_id: int = None, limit: int = 100, after_id: int = 0) -> dict:
     """List balanced journal entries, optionally those touching one account."""
+    if error := page_args(limit, after_id):
+        return bapi_error(error)
     with get_conn() as conn:
-        query = "SELECT * FROM journal_entries"
-        params = ()
+        query = "SELECT * FROM journal_entries WHERE journal_id > ?"
+        params = [after_id]
         if account_id is not None:
-            query += " WHERE journal_id IN (SELECT journal_id FROM journal_lines WHERE account_id = ?)"
-            params = (account_id,)
-        entries = rows_to_dicts(conn.execute(query + " ORDER BY journal_id", params).fetchall())
-        for entry in entries:
-            entry["lines"] = [
-                {**dict(row), "debit": row["debit"] / 100, "credit": row["credit"] / 100}
-                for row in conn.execute(
-                    "SELECT line_no, account_id, debit, credit FROM journal_lines WHERE journal_id = ? ORDER BY line_no",
-                    (entry["journal_id"],),
-                )
-            ]
-    return bapi_result(data=entries)
+            query += " AND journal_id IN (SELECT journal_id FROM journal_lines WHERE account_id = ?)"
+            params.append(account_id)
+        params.append(limit + 1)
+        entries = rows_to_dicts(conn.execute(query + " ORDER BY journal_id LIMIT ?", params).fetchall())
+        page_entries = entries[:limit]
+        lines_by_journal = {entry["journal_id"]: [] for entry in page_entries}
+        if page_entries:
+            ids = list(lines_by_journal)
+            for row in conn.execute(
+                f"SELECT journal_id, line_no, account_id, debit, credit FROM journal_lines "
+                f"WHERE journal_id IN ({','.join('?' for _ in ids)}) ORDER BY journal_id, line_no", ids
+            ):
+                lines_by_journal[row["journal_id"]].append({
+                    **dict(row), "debit": row["debit"] / 100, "credit": row["credit"] / 100,
+                })
+        for entry in page_entries:
+            entry["lines"] = lines_by_journal[entry["journal_id"]]
+    return paged_result(entries, limit, "journal_id", lambda entry: entry)
 
 
 def BAPI_GL_ACCOUNT_SUMMARY(start_date: str = None, end_date: str = None) -> dict:
@@ -132,9 +140,9 @@ def BAPI_INCOMINGINVOICE_CREATE(vendor_id: int, amount: float, reference: str = 
         if not vendor:
             return bapi_error(f"Vendor {vendor_id} not found")
         cur = conn.execute(
-            "INSERT INTO invoices (direction, party_id, reference, amount, status, due_date) "
-            "VALUES ('AP', ?, ?, ?, 'OPEN', ?)",
-            (vendor_id, reference, amount, due_date),
+            "INSERT INTO invoices (direction, party_id, reference, amount, status, due_date, invoice_date) "
+            "VALUES ('AP', ?, ?, ?, 'OPEN', ?, ?)",
+            (vendor_id, reference, amount, due_date, date.today().isoformat()),
         )
         invoice_id = cur.lastrowid
     return bapi_result(
@@ -168,7 +176,8 @@ def BAPI_AP_PAYMENT_POST(invoice_id: int, amount: float, method: str = "TRANSFER
             "INSERT INTO payments (invoice_id, amount, posted_date, method) VALUES (?, ?, ?, ?)",
             (invoice_id, amount, date.today().isoformat(), method),
         )
-        conn.execute("UPDATE invoices SET status = 'PAID' WHERE invoice_id = ?", (invoice_id,))
+        conn.execute("UPDATE invoices SET status = 'PAID', paid_date = ? WHERE invoice_id = ?",
+                     (date.today().isoformat(), invoice_id))
 
         ap_account = _gl_account_id(conn, "Accounts Payable")
         cash_account = _gl_account_id(conn, "Cash")
@@ -189,9 +198,9 @@ def BAPI_AR_INVOICE_CREATE(customer_id: int, amount: float, reference: str = "",
         if not customer:
             return bapi_error(f"Customer {customer_id} not found")
         cur = conn.execute(
-            "INSERT INTO invoices (direction, party_id, reference, amount, status, due_date) "
-            "VALUES ('AR', ?, ?, ?, 'OPEN', ?)",
-            (customer_id, reference, amount, due_date),
+            "INSERT INTO invoices (direction, party_id, reference, amount, status, due_date, invoice_date) "
+            "VALUES ('AR', ?, ?, ?, 'OPEN', ?, ?)",
+            (customer_id, reference, amount, due_date, date.today().isoformat()),
         )
         invoice_id = cur.lastrowid
     return bapi_result(
@@ -225,7 +234,8 @@ def BAPI_AR_PAYMENT_POST(invoice_id: int, amount: float, method: str = "TRANSFER
             "INSERT INTO payments (invoice_id, amount, posted_date, method) VALUES (?, ?, ?, ?)",
             (invoice_id, amount, date.today().isoformat(), method),
         )
-        conn.execute("UPDATE invoices SET status = 'PAID' WHERE invoice_id = ?", (invoice_id,))
+        conn.execute("UPDATE invoices SET status = 'PAID', paid_date = ? WHERE invoice_id = ?",
+                     (date.today().isoformat(), invoice_id))
 
         ar_account = _gl_account_id(conn, "Accounts Receivable")
         cash_account = _gl_account_id(conn, "Cash")

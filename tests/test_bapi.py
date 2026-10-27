@@ -32,18 +32,30 @@ def test_vendor_lifecycle():
     vendor_id = created["DATA"]["vendor_id"]
 
     listed = BAPI_VENDOR_GETLIST()
-    assert any(v["vendor_id"] == vendor_id for v in listed["DATA"])
+    assert any(v["vendor_id"] == vendor_id for v in listed["DATA"]["items"])
 
     detail = BAPI_VENDOR_GETDETAIL(vendor_id)
     assert detail["DATA"]["name"] == "Acme Supplies"
     assert BAPI_VENDOR_GETDETAIL(999999)["RETURN"][0]["type"] == "E"
 
 
+def test_getlist_keyset_pagination():
+    for name in ("Page One", "Page Two", "Page Three"):
+        BAPI_VENDOR_CREATE(name=name)
+    first = BAPI_VENDOR_GETLIST(limit=2)["DATA"]
+    assert len(first["items"]) == 2
+    assert first["page"]["has_more"] is True
+    second = BAPI_VENDOR_GETLIST(limit=2, after_id=first["page"]["next_after_id"])["DATA"]
+    assert second["items"][0]["vendor_id"] > first["items"][-1]["vendor_id"]
+    assert BAPI_VENDOR_GETLIST(limit=0)["RETURN"][0]["type"] == "E"
+    assert BAPI_VENDOR_GETLIST(limit=1001)["RETURN"][0]["type"] == "E"
+
+
 def test_material_and_stock():
     vendor_id = BAPI_VENDOR_CREATE(name="Bolt Vendor")["DATA"]["vendor_id"]
     material_id = BAPI_MATERIAL_CREATE(description="Steel Bolt", unit_price=1.5)["DATA"]["material_id"]
 
-    stock_before = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"][0]["qty_on_hand"]
+    stock_before = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"]["items"][0]["qty_on_hand"]
     assert stock_before == 0
 
     po = BAPI_PO_CREATE(vendor_id=vendor_id, items=[{"material_id": material_id, "qty": 50}])
@@ -51,7 +63,7 @@ def test_material_and_stock():
     assert po["DATA"]["total_amount"] == 75.0
 
     BAPI_GOODSMVT_CREATE(po_id=po_id, material_id=material_id, qty=50)
-    stock_after = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"][0]["qty_on_hand"]
+    stock_after = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"]["items"][0]["qty_on_hand"]
     assert stock_after == 50
 
     detail = BAPI_PO_GETDETAIL(po_id)
@@ -71,7 +83,7 @@ def test_sales_order_checks_stock():
 
     ok = BAPI_SALESORDER_CREATE(customer_id=customer_id, items=[{"material_id": material_id, "qty": 5}])
     assert ok["RETURN"][0]["type"] == "S"
-    remaining = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"][0]["qty_on_hand"]
+    remaining = BAPI_MATERIAL_STOCK_GETLIST(material_id=material_id)["DATA"]["items"][0]["qty_on_hand"]
     assert remaining == 15
 
 
@@ -103,10 +115,10 @@ def test_hr_leave_and_payroll_balances():
     before = {row["name"]: row["balance"] for row in BAPI_GL_ACCOUNT_GETLIST()["DATA"]}
     run = BAPI_HR_PAYROLL_RUN("2026-09", [{"employee_id": employee, "amount": 200.25}])
     assert run["RETURN"][0]["type"] == "S"
-    payslip = next(row for row in BAPI_HR_PAYSLIP_GETLIST("2026-09")["DATA"]
+    payslip = next(row for row in BAPI_HR_PAYSLIP_GETLIST("2026-09")["DATA"]["items"]
                    if row["employee_id"] == employee)
     assert (payslip["gross"], payslip["deduction"], payslip["net"]) == (1200.5, 200.25, 1000.25)
-    journal = next(row for row in BAPI_GL_JOURNAL_GETLIST()["DATA"]
+    journal = next(row for row in BAPI_GL_JOURNAL_GETLIST()["DATA"]["items"]
                    if row["journal_id"] == payslip["journal_id"])
     assert sum(line["debit"] for line in journal["lines"]) == sum(line["credit"] for line in journal["lines"])
     after = {row["name"]: row["balance"] for row in BAPI_GL_ACCOUNT_GETLIST()["DATA"]}
@@ -128,12 +140,12 @@ def test_finance_validation_and_balanced_journal():
                                 {"account_id": expense, "credit": 0}])["RETURN"][0]["type"] == "E"
     assert BAPI_GL_JOURNAL_POST([{"account_id": cash, "debit": 0.001},
                                 {"account_id": expense, "credit": 0.001}])["RETURN"][0]["type"] == "E"
-    before = BAPI_GL_JOURNAL_GETLIST()["DATA"]
+    before = BAPI_GL_JOURNAL_GETLIST()["DATA"]["items"]
     ok = BAPI_GL_JOURNAL_POST([{"account_id": cash, "debit": 10.25},
                                {"account_id": expense, "credit": 10.25}], "Test")
     assert ok["RETURN"][0]["type"] == "S"
-    assert len(BAPI_GL_JOURNAL_GETLIST(cash)["DATA"]) >= 1
-    assert len(BAPI_GL_JOURNAL_GETLIST()["DATA"]) == len(before) + 1
+    assert len(BAPI_GL_JOURNAL_GETLIST(cash)["DATA"]["items"]) >= 1
+    assert len(BAPI_GL_JOURNAL_GETLIST()["DATA"]["items"]) == len(before) + 1
     assert any(row["debits"] > 0 for row in BAPI_GL_ACCOUNT_SUMMARY()["DATA"])
 
     customer = BAPI_CUSTOMER_CREATE("Finance Customer")["DATA"]["customer_id"]
@@ -146,18 +158,13 @@ def test_finance_validation_and_balanced_journal():
 
 def test_migrate_existing_database_preserves_history(tmp_path):
     path = tmp_path / "legacy.db"
-    schema = Path(__file__).resolve().parents[1] / "data" / "schema.sql"
-    old_schema = schema.read_text().split("CREATE TABLE journal_entries")[0]
-    old_schema += "\nINSERT INTO gl_accounts (name, account_type) VALUES ('Cash', 'ASSET');"
-    conn = sqlite3.connect(path)
-    conn.executescript(old_schema)
-    conn.execute("INSERT INTO gl_postings (account_id, amount, posting_date) VALUES (1, 42, '2024-01-01')")
-    conn.commit()
-    conn.close()
+    init_schema(str(path))
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO gl_postings (account_id, amount, posting_date) VALUES (1, 42, '2024-01-01')")
     migrate_schema(str(path))
     migrate_schema(str(path))
     with get_conn(str(path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute("SELECT amount FROM gl_postings").fetchone()[0] == 42
         assert conn.execute("SELECT COUNT(*) FROM gl_accounts WHERE name = 'Payroll Expense'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0] == 0
@@ -167,9 +174,9 @@ def test_payroll_validation_keeps_transactions_atomic():
     department = BAPI_HR_DEPARTMENT_CREATE("Payroll Atomicity")["DATA"]["department_id"]
     employee = BAPI_HR_EMPLOYEE_CREATE("Bex", department, "2026-01-01", 500)["DATA"]["employee_id"]
     assert BAPI_HR_PAYROLL_RUN("2026-02", [{"employee_id": employee, "amount": 501}])["RETURN"][0]["type"] == "E"
-    assert BAPI_HR_PAYSLIP_GETLIST("2026-02")["DATA"] == []
+    assert BAPI_HR_PAYSLIP_GETLIST("2026-02")["DATA"]["items"] == []
     assert BAPI_HR_PAYROLL_RUN("2026-02", [{"employee_id": employee, "amount": 500}])["RETURN"][0]["type"] == "S"
-    payslip = next(p for p in BAPI_HR_PAYSLIP_GETLIST("2026-02")["DATA"] if p["employee_id"] == employee)
+    payslip = next(p for p in BAPI_HR_PAYSLIP_GETLIST("2026-02")["DATA"]["items"] if p["employee_id"] == employee)
     assert payslip["net"] == 0
     assert BAPI_HR_PAYROLL_RUN("2026-13")["RETURN"][0]["type"] == "E"
 
@@ -180,7 +187,7 @@ def test_new_schema_migration_is_safe(tmp_path):
     migrate_schema(path)
     migrate_schema(path)
     with get_conn(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM gl_accounts WHERE name = 'Payroll Expense'").fetchone()[0] == 1
 
 
@@ -190,8 +197,11 @@ def test_seed_hr_and_finance_on_new_database(tmp_path, monkeypatch):
     path = str(tmp_path / "seed.db")
     init_schema(path)
     monkeypatch.setattr(db, "DB_PATH", path)
-    run_seed()
+    counts = run_seed("test")
     with get_conn(path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM employees").fetchone()[0] == 6
         assert conn.execute("SELECT COUNT(*) FROM payslips").fetchone()[0] == 6
         assert conn.execute("SELECT COUNT(*) FROM journal_entries").fetchone()[0] > 6
+        assert conn.execute("SELECT COUNT(*) FROM vendor_materials").fetchone()[0] >= 8
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert counts["invoices"] >= 22

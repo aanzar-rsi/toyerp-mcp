@@ -10,7 +10,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from server.db import get_conn, init_schema, migrate_schema
 from server.mcp_server import RESOURCE_URL, TOOL_NAMES, mcp
-from server.security import bootstrap_admin, session
+from server.security import bootstrap_admin, check_password, default_roles, provision_security_defaults, session
 
 
 @pytest.fixture
@@ -124,7 +124,7 @@ def test_bootstrap_one_time_and_migrate_v1(tmp_path):
     migrate_schema(path)
     migrate_schema(path)
     with get_conn(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     # Bootstrapping cannot run twice even if the second username is different.
     import server.db as db
     old = db.DB_PATH
@@ -172,5 +172,92 @@ def test_legacy_v1_security_migration(tmp_path):
     migrate_schema(path)
     with get_conn(path) as conn:
         assert conn.execute("SELECT amount FROM gl_postings").fetchone()[0] == 17
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+
+
+def test_default_admin_and_roles_are_idempotent(tmp_path, monkeypatch):
+    import server.db as db
+    path = str(tmp_path / "defaults.db")
+    init_schema(path)
+    monkeypatch.setattr(db, "DB_PATH", path)
+
+    generated = provision_security_defaults(TOOL_NAMES, password="initial secure password")
+    assert generated is None
+    assert provision_security_defaults(TOOL_NAMES, password="must not replace password") is None
+
+    expected = default_roles(TOOL_NAMES)
+    assert set(expected) == {"HR_ALL", "FINANCE_ALL", "PROCUREMENT_ALL", "SALES_ALL",
+                             "INVENTORY_ALL", "MASTER_DATA_ALL", "ERP_READ_ONLY"}
+    assert "BAPI_HR_PAYROLL_RUN" in expected["HR_ALL"]
+    assert "BAPI_GL_JOURNAL_POST" in expected["FINANCE_ALL"]
+    assert "BAPI_PO_CREATE" in expected["PROCUREMENT_ALL"]
+    assert "BAPI_SALESORDER_CREATE" in expected["SALES_ALL"]
+    assert "BAPI_GOODSMVT_CREATE" in expected["INVENTORY_ALL"]
+    assert "BAPI_CUSTOMER_CREATE" in expected["MASTER_DATA_ALL"]
+    assert "BAPI_VENDOR_GETLIST" in expected["ERP_READ_ONLY"]
+    assert "BAPI_VENDOR_CREATE" not in expected["ERP_READ_ONLY"]
+    with get_conn() as conn:
+        admin = conn.execute("SELECT * FROM users WHERE username = 'super_admin'").fetchone()
+        assert admin["is_admin"] == 1
+        assert check_password("initial secure password", admin["password_hash"])
+        assert not check_password("must not replace password", admin["password_hash"])
+        assert {row[0] for row in conn.execute("SELECT name FROM roles")} == set(expected)
+        for role, tools in expected.items():
+            actual = {row[0] for row in conn.execute(
+                "SELECT tool_name FROM role_tools JOIN roles USING (role_id) WHERE name = ?", (role,)
+            )}
+            assert actual == tools
+
+
+def test_default_admin_generates_password(tmp_path, monkeypatch):
+    import server.db as db
+    path = str(tmp_path / "generated.db")
+    init_schema(path)
+    monkeypatch.setattr(db, "DB_PATH", path)
+    password = provision_security_defaults(TOOL_NAMES)
+    assert password and len(password) >= 12
+    with get_conn() as conn:
+        stored = conn.execute("SELECT password_hash FROM users WHERE username = 'super_admin'").fetchone()[0]
+    assert check_password(password, stored)
+
+
+def test_file_default_users_are_created_and_assigned_once(tmp_path, monkeypatch):
+    import server.db as db
+    from server.security import provision_default_users
+    path = str(tmp_path / "file-defaults.db")
+    users = tmp_path / "users.txt"
+    users.write_text(
+        "ahad-anzar|a secure admin password|ADMIN\n"
+        "hr-user|a secure human resources password|HR_ALL\n"
+        "finance-user|a secure finance password|FINANCE_ALL\n",
+        encoding="utf-8",
+    )
+    init_schema(path)
+    monkeypatch.setattr(db, "DB_PATH", path)
+
+    assert provision_default_users(TOOL_NAMES, users) == ["ahad-anzar", "hr-user", "finance-user"]
+    assert provision_default_users(TOOL_NAMES, users) == []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT u.username, u.is_admin, r.name FROM users u "
+            "LEFT JOIN user_roles ur USING (user_id) LEFT JOIN roles r USING (role_id) "
+            "WHERE u.username IN ('ahad-anzar','hr-user','finance-user') ORDER BY u.username"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("ahad-anzar", 1, None),
+            ("finance-user", 0, "FINANCE_ALL"),
+            ("hr-user", 0, "HR_ALL"),
+        ]
+
+
+def test_default_admin_does_not_promote_existing_user(tmp_path, monkeypatch):
+    import server.db as db
+    path = str(tmp_path / "collision.db")
+    init_schema(path)
+    monkeypatch.setattr(db, "DB_PATH", path)
+    with get_conn() as conn:
+        conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                     ("super_admin", "not-used"))
+    with pytest.raises(ValueError, match="non-admin"):
+        provision_security_defaults(TOOL_NAMES, password="initial secure password")
